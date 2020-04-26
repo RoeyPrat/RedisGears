@@ -16,6 +16,8 @@
 #include "common.h"
 #include "GearsBuilder.auto.h"
 #include "cloudpickle.auto.h"
+#include "version.h"
+#include "utils/thpool.h"
 
 #define SUB_INTERPRETER_TYPE "subInterpreterType"
 
@@ -29,6 +31,32 @@ typedef struct RAI_Error {
 static PyObject* pyGlobals;
 PyObject* GearsError;
 PyObject* ForceStoppedError;
+
+RecordType* pythonRecordType;
+
+typedef struct PythonRecord{
+    Record base;
+    PyObject* obj;
+}PythonRecord;
+
+static Record* PyObjRecordCreate(){
+    PythonRecord* ret = (PythonRecord*)RedisGears_RecordCreate(pythonRecordType);
+    ret->obj = NULL;
+    return &ret->base;
+}
+
+static PyObject* PyObjRecordGet(Record* base){
+    assert(base->type == pythonRecordType);
+    PythonRecord* r = (PythonRecord*)base;
+    return r->obj;
+}
+
+static void PyObjRecordSet(Record* base, PyObject* obj){
+    assert(base->type == pythonRecordType);
+    PythonRecord* r = (PythonRecord*)base;
+    r->obj = obj;
+}
+
 
 /*
  * Contains thread pacific data like:
@@ -77,6 +105,7 @@ typedef struct PythonRequirementCtx{
     char* basePath;
     char* name;
     char** wheels;
+    volatile bool isInstalled;
 }PythonRequirementCtx;
 
 Gears_dict* RequirementsDict = NULL;
@@ -87,14 +116,23 @@ typedef struct PythonSessionCtx{
     char sessionIdStr[STR_ID_LEN];
     PyObject* globalsDict;
     PythonRequirementCtx** requirements;
+    bool isInstallationNeeded;
 }PythonSessionCtx;
+
+static PyObject* GearsPyDict_GetItemString(PyObject* dict, const char* key){
+    return (dict ? PyDict_GetItemString(dict, key) : NULL);
+}
 
 static bool PythonRequirementCtx_DownloadRequirement(PythonRequirementCtx* req){
 #define RETRY 3
 #define RETRY_SLEEP_IN_SEC 1
     int exitCode;
     for(size_t i = 0 ; i < RETRY; ++i){
-        exitCode = ExecCommand(NULL, "/bin/bash -c \"source %s/bin/activate;cd %s;python -m pip wheel %s\"", venvDir, req->basePath, req->name);
+        if(GearsConfig_CreateVenv()){
+            exitCode = ExecCommand(NULL, "/bin/bash -c \"source %s/bin/activate;cd %s;python -m pip wheel %s\"", venvDir, req->basePath, req->name);
+        }else{
+            exitCode = ExecCommand(NULL, "/bin/bash -c \"cd %s;%s/bin/python3 -m pip wheel %s\"", req->basePath, venvDir, req->name);
+        }
         if(exitCode != 0){
             sleep(RETRY_SLEEP_IN_SEC);
             continue;
@@ -133,7 +171,12 @@ static bool PythonRequirementCtx_InstallRequirement(PythonRequirementCtx* req){
     }
     filesInDir[array_len(filesInDir) - 1] = '\0';
 
-    int exitCode = ExecCommand(NULL, "/bin/bash -c \"source %s/bin/activate;cd %s;python -m pip install %s\"", venvDir, req->basePath, filesInDir);
+    int exitCode;
+    if(GearsConfig_CreateVenv()){
+        exitCode = ExecCommand(NULL, "/bin/bash -c \"source %s/bin/activate; cd %s; python -m pip install --disable-pip-version-check %s\"", venvDir, req->basePath, filesInDir);
+    }else{
+        exitCode = ExecCommand(NULL, "/bin/bash -c \"cd %s; %s/bin/python3 -m pip install --disable-pip-version-check %s\"", req->basePath, venvDir, filesInDir);
+    }
     array_free(filesInDir);
     return exitCode == 0;
 }
@@ -189,7 +232,7 @@ static PythonRequirementCtx* PythonRequirementCtx_Create(const char* requirement
     ret->name = RG_STRDUP(requirement);
     rg_asprintf(&ret->basePath, "%s/%s", venvDir, ret->name);
     ret->wheels = array_new(char*, 10);
-    // refCount is starting from 2, one hold by RequirementsDict and once by the called.
+    // refCount is starting from 2, one hold by RequirementsDict and once by the caller.
     // currently we basically never delete requirments so we will know not to reinstall them
     // to save time
     ret->refCount = 2;
@@ -197,6 +240,8 @@ static PythonRequirementCtx* PythonRequirementCtx_Create(const char* requirement
     Gears_dictAdd(RequirementsDict, ret->name, ret);
 
     PythonRequirementCtx_VerifyBasePath(ret);
+
+    ret->isInstalled = false;
 
     return ret;
 }
@@ -336,6 +381,24 @@ static PythonSessionCtx* PythonSessionCtx_Get(char* id){
     return Gears_dictFetchValue(SessionsDict, id);
 }
 
+static int PythonSessionCtx_DownloadAndInstallDeps(PythonSessionCtx* session){
+    for(size_t i = 0 ; i < array_len(session->requirements) ; ++i){
+        PythonRequirementCtx* req = session->requirements[i];
+        if(req->isInstalled){
+            continue;
+        }
+        if(!PythonRequirementCtx_DownloadRequirement(req)){
+            return false;
+        }
+
+        if(!PythonRequirementCtx_InstallRequirement(req)){
+            return false;
+        }
+        req->isInstalled = true;
+    }
+    return true;
+}
+
 static PythonSessionCtx* PythonSessionCtx_CreateWithId(char* id, const char** requirementsList, size_t requirementsListLen){
     // creating a new global dict for this session
     void* old = RedisGearsPy_Lock(NULL);
@@ -346,6 +409,7 @@ static PythonSessionCtx* PythonSessionCtx_CreateWithId(char* id, const char** re
     *session = (PythonSessionCtx){
             .refCount = 1,
             .globalsDict = globalDict,
+            .isInstallationNeeded = false,
     };
     SetId(NULL, session->sessionId, session->sessionIdStr, &CurrSessionId);
 
@@ -358,26 +422,19 @@ static PythonSessionCtx* PythonSessionCtx_CreateWithId(char* id, const char** re
 
         if(!req){
             req = PythonRequirementCtx_Create(requirementsList[i]);
+            session->isInstallationNeeded = true;
 
             if(!req){
                 PythonSessionCtx_Free(session);
                 session = NULL;
                 break;
             }
+        }
 
-            if(!PythonRequirementCtx_DownloadRequirement(req)){
-                PythonRequirementCtx_Free(req);
-                PythonSessionCtx_Free(session);
-                session = NULL;
-                break;
-            }
-
-            if(!PythonRequirementCtx_InstallRequirement(req)){
-                PythonRequirementCtx_Free(req);
-                PythonSessionCtx_Free(session);
-                session = NULL;
-                break;
-            }
+        if(!req->isInstalled){
+            // it could be that the requirement already exits but not yet installed
+            // in this case we will move the execution to background installation also.
+            session->isInstallationNeeded = true;
         }
 
         session->requirements = array_append(session->requirements , req);
@@ -762,8 +819,8 @@ static void onDoneSerializeResults(ExecutionPlan* ep, void* privateData){
     Gears_Buffer* buff = Gears_BufferCreate();
     for(long long i = 0 ; i < len ; ++i){
         Record* r = RedisGears_GetRecord(ep, i);
-        assert(RedisGears_RecordGetType(r) == PY_RECORD);
-        PyObject* obj = RG_PyObjRecordGet(r);
+        assert(RedisGears_RecordGetType(r) == pythonRecordType);
+        PyObject* obj = PyObjRecordGet(r);
         Gears_BufferWriter bw;
         Gears_BufferWriterInit(&bw, buff);
         RedisGearsPy_PyCallbackSerialize(obj, &bw, NULL);
@@ -788,7 +845,47 @@ static void dropExecutionOnDone(ExecutionPlan* ep, void* privateData){
     RedisGears_DropExecution(ep);
 }
 
-static PyObject* run(PyObject *self, PyObject *args){
+static void* runCreateStreamReaderArgs(const char* pattern, PyObject *kargs){
+    const char* defaultFromIdStr = "0-0";
+    const char* fromIdStr = defaultFromIdStr;
+    PyObject* pyFromId = GearsPyDict_GetItemString(kargs, "fromId");
+    if(pyFromId){
+        if(!PyUnicode_Check(pyFromId)){
+            PyErr_SetString(GearsError, "fromId argument must be a string");
+            return NULL;
+        }
+        fromIdStr = PyUnicode_AsUTF8AndSize(pyFromId, NULL);
+    }
+    return RedisGears_StreamReaderCtxCreate(pattern, fromIdStr);
+}
+
+static void* runCreateKeysReaderArgs(const char* pattern, PyObject *kargs){
+    bool noScan = false;
+    PyObject* pyNoScan = GearsPyDict_GetItemString(kargs, "noScan");
+    if(pyNoScan){
+        if(!PyBool_Check(pyNoScan)){
+            PyErr_SetString(GearsError, "exactMatch value is not boolean");
+            return NULL;
+        }
+        if(pyNoScan == Py_True){
+            noScan = true;
+        }
+    }
+    bool readValue = true;
+    PyObject* pyReadValue = GearsPyDict_GetItemString(kargs, "readValue");
+    if(pyReadValue){
+        if(!PyBool_Check(pyReadValue)){
+            PyErr_SetString(GearsError, "readValue value is not boolean");
+            return NULL;
+        }
+        if(pyReadValue == Py_False){
+            readValue = false;
+        }
+    }
+    return RedisGears_KeysReaderCtxCreate(pattern, readValue, NULL, noScan);
+}
+
+static PyObject* run(PyObject *self, PyObject *args,  PyObject *kargs){
     PythonThreadCtx* ptctx = GetPythonThreadCtx();
     PyFlatExecution* pfep = (PyFlatExecution*)self;
 
@@ -803,8 +900,8 @@ static PyObject* run(PyObject *self, PyObject *args){
         return NULL;
     }
 
-    char* defaultRegexStr = "*";
-    char* regexStr = defaultRegexStr;
+    const char* defaultRegexStr = "*";
+    const char* patternStr = defaultRegexStr;
     void* arg;
     if (strcmp(RedisGears_GetReader(pfep->fep), "PythonReader") == 0){
         if(PyTuple_Size(args) != 1){
@@ -819,22 +916,25 @@ static PyObject* run(PyObject *self, PyObject *args){
         Py_INCREF((PyObject*)arg);
     }else{
         if(PyTuple_Size(args) > 0){
-            PyObject* regex = PyTuple_GetItem(args, 0);
-            if(!PyUnicode_Check(regex)){
+            PyObject* pattern = PyTuple_GetItem(args, 0);
+            if(!PyUnicode_Check(pattern)){
                 PyErr_SetString(GearsError, "regex argument must be a string");
                 return NULL;
             }
-            regexStr = (char*)PyUnicode_AsUTF8AndSize(regex, NULL);
+            patternStr = PyUnicode_AsUTF8AndSize(pattern, NULL);
         }
         if(strcmp(RedisGears_GetReader(pfep->fep), "StreamReader") == 0){
-            arg = RedisGears_StreamReaderCtxCreate(regexStr, "0-0");
-        }else if(strcmp(RedisGears_GetReader(pfep->fep), "KeysReader") == 0 ||
-                 strcmp(RedisGears_GetReader(pfep->fep), "KeysOnlyReader") == 0){
-            arg = RG_STRDUP(regexStr);
+            arg = runCreateStreamReaderArgs(patternStr, kargs);
+        }else if(strcmp(RedisGears_GetReader(pfep->fep), "KeysReader") == 0){
+            arg = runCreateKeysReaderArgs(patternStr, kargs);
         }else{
-            PyErr_SetString(GearsError, "Given reader do not support run");
+            PyErr_SetString(GearsError, "Given reader do not support run or not exists");
             return NULL;
         }
+    }
+
+    if(arg == NULL){
+        return NULL;
     }
 
     char* err = NULL;
@@ -849,9 +949,12 @@ static PyObject* run(PyObject *self, PyObject *args){
         if(strcmp(RedisGears_GetReader(pfep->fep), "StreamReader") == 0){
             RedisGears_StreamReaderCtxFree(arg);
         }else if(strcmp(RedisGears_GetReader(pfep->fep), "KeysReader") == 0){
-            RG_FREE(arg);
-        }else{
+            RedisGears_KeysReaderCtxFree(arg);
+        }else if(strcmp(RedisGears_GetReader(pfep->fep), "PythonReader") == 0){
             Py_DECREF((PyObject*)arg);
+        }else{
+            RedisModule_Log(NULL, "warning", "unknown reader when try to free reader args");
+            assert(false);
         }
         return NULL;
     }
@@ -886,15 +989,16 @@ static int registerStrKeyTypeToInt(const char* keyType){
     return -1;
 }
 
-static void* registerCreateKeysArgs(PyObject *kargs, const char* regexStr, ExecutionMode mode){
+static void* registerCreateKeysArgs(PyObject *kargs, const char* prefix, ExecutionMode mode){
     Arr(char*) eventTypes = NULL;
     Arr(int) keyTypes = NULL;
 
     // getting even types white list (no list == all event types)
-    PyObject* pyEventTypes = PyDict_GetItemString(kargs, "eventTypes");
+    PyObject* pyEventTypes = GearsPyDict_GetItemString(kargs, "eventTypes");
     if(pyEventTypes && pyEventTypes != Py_None){
         PyObject* eventTypesIterator = PyObject_GetIter(pyEventTypes);
         if(!eventTypesIterator){
+            PyErr_SetString(GearsError, "given eventTypes is not iterable");
             return NULL;
         }
         eventTypes = array_new(char*, 10);
@@ -914,10 +1018,11 @@ static void* registerCreateKeysArgs(PyObject *kargs, const char* regexStr, Execu
     }
 
     // getting key types white list (no list == all key types)
-    PyObject* pyKeyTypes = PyDict_GetItemString(kargs, "keyTypes");
+    PyObject* pyKeyTypes = GearsPyDict_GetItemString(kargs, "keyTypes");
     if(pyKeyTypes && pyKeyTypes != Py_None){
         PyObject* keyTypesIterator = PyObject_GetIter(pyKeyTypes);
         if(!keyTypesIterator){
+            PyErr_SetString(GearsError, "given keyTypes is not iterable");
             return NULL;
         }
         keyTypes = array_new(char*, 10);
@@ -943,7 +1048,20 @@ static void* registerCreateKeysArgs(PyObject *kargs, const char* regexStr, Execu
         }
         Py_DECREF(keyTypesIterator);
     }
-    return RedisGears_KeysReaderTriggerArgsCreate(regexStr, eventTypes, keyTypes);
+
+    bool readValue = true;
+    PyObject* pyReadValue = GearsPyDict_GetItemString(kargs, "readValue");
+    if(pyReadValue){
+        if(!PyBool_Check(pyReadValue)){
+            PyErr_SetString(GearsError, "readValue is not boolean");
+            return NULL;
+        }
+        if(pyReadValue == Py_False){
+            readValue = false;
+        }
+    }
+
+    return RedisGears_KeysReaderTriggerArgsCreate(prefix, eventTypes, keyTypes, readValue);
 }
 
 static OnFailedPolicy getOnFailedPolicy(const char* onFailurePolicyStr){
@@ -959,9 +1077,9 @@ static OnFailedPolicy getOnFailedPolicy(const char* onFailurePolicyStr){
     return OnFailedPolicyUnknown;
 }
 
-static void* registerCreateStreamArgs(PyObject *kargs, const char* regexStr, ExecutionMode mode){
+static void* registerCreateStreamArgs(PyObject *kargs, const char* prefix, ExecutionMode mode){
     size_t batch = 1;
-    PyObject* pyBatch = PyDict_GetItemString(kargs, "batch");
+    PyObject* pyBatch = GearsPyDict_GetItemString(kargs, "batch");
     if(pyBatch){
         if(PyNumber_Check(pyBatch)){
             batch = PyNumber_AsSsize_t(pyBatch, NULL);
@@ -972,7 +1090,7 @@ static void* registerCreateStreamArgs(PyObject *kargs, const char* regexStr, Exe
     }
 
     size_t durationMS = 0;
-    PyObject* pydurationInSec = PyDict_GetItemString(kargs, "duration");
+    PyObject* pydurationInSec = GearsPyDict_GetItemString(kargs, "duration");
     if(pydurationInSec){
         if(PyNumber_Check(pydurationInSec)){
             durationMS = PyNumber_AsSsize_t(pydurationInSec, NULL);
@@ -983,7 +1101,7 @@ static void* registerCreateStreamArgs(PyObject *kargs, const char* regexStr, Exe
     }
 
     OnFailedPolicy onFailedPolicy = OnFailedPolicyContinue;
-    PyObject* pyOnFailedPolicy = PyDict_GetItemString(kargs, "onFailedPolicy");
+    PyObject* pyOnFailedPolicy = GearsPyDict_GetItemString(kargs, "onFailedPolicy");
     if(pyOnFailedPolicy){
         if(PyUnicode_Check(pyOnFailedPolicy)){
             const char* onFailedPolicyStr = PyUnicode_AsUTF8AndSize(pyOnFailedPolicy, NULL);
@@ -1003,7 +1121,7 @@ static void* registerCreateStreamArgs(PyObject *kargs, const char* regexStr, Exe
     }
 
     size_t retryInterval = 1;
-    PyObject* pyRetryInterval = PyDict_GetItemString(kargs, "onFailedRetryInterval");
+    PyObject* pyRetryInterval = GearsPyDict_GetItemString(kargs, "onFailedRetryInterval");
     if(pyRetryInterval){
         if(PyNumber_Check(pyRetryInterval)){
             retryInterval = PyNumber_AsSsize_t(pyRetryInterval, NULL);
@@ -1014,7 +1132,7 @@ static void* registerCreateStreamArgs(PyObject *kargs, const char* regexStr, Exe
     }
 
     bool trimStream = true;
-    PyObject* pyTrimStream = PyDict_GetItemString(kargs, "trimStream");
+    PyObject* pyTrimStream = GearsPyDict_GetItemString(kargs, "trimStream");
     if(pyTrimStream){
         if(PyBool_Check(pyTrimStream)){
             if(Py_True == pyTrimStream){
@@ -1028,28 +1146,18 @@ static void* registerCreateStreamArgs(PyObject *kargs, const char* regexStr, Exe
         }
     }
 
-    return RedisGears_StreamReaderTriggerArgsCreate(regexStr, batch, durationMS, onFailedPolicy, retryInterval, trimStream);
-}
-
-static void registerFreeArgs(FlatExecutionPlan* fep, void* args){
-    const char* reader = RedisGears_GetReader(fep);
-    if (strcmp(reader, "KeysReader") == 0 ||
-            strcmp(reader, "KeysOnlyReader") == 0) {
-        RedisGears_KeysReaderTriggerArgsFree(args);
-    }else if (strcmp(reader, "StreamReader") == 0){
-        RedisGears_StreamReaderTriggerArgsFree(args);
-    }
+    return RedisGears_StreamReaderTriggerArgsCreate(prefix, batch, durationMS, onFailedPolicy, retryInterval, trimStream);
 }
 
 static void* registerCreateCommandArgs(PyObject *kargs){
     const char* trigger = NULL;
-    PyObject* pyTrigger = PyDict_GetItemString(kargs, "trigger");
+    PyObject* pyTrigger = GearsPyDict_GetItemString(kargs, "trigger");
     if(!pyTrigger){
-        PyErr_SetString(GearsError, "command argument was not given");
+        PyErr_SetString(GearsError, "trigger argument was not given");
         return NULL;
     }
     if(!PyUnicode_Check(pyTrigger)){
-        PyErr_SetString(GearsError, "command argument is not string");
+        PyErr_SetString(GearsError, "trigger argument is not string");
         return NULL;
     }
     trigger = PyUnicode_AsUTF8AndSize(pyTrigger, NULL);
@@ -1062,23 +1170,22 @@ static void* registerCreateArgs(FlatExecutionPlan* fep, PyObject *kargs, Executi
         return registerCreateCommandArgs(kargs);
     }
 
-    char* defaultRegexStr = "*";
-    const char* regexStr = defaultRegexStr;
-    PyObject* regex = PyDict_GetItemString(kargs, "regex");
-    if(regex){
-        if(PyUnicode_Check(regex)){
-            regexStr = PyUnicode_AsUTF8AndSize(regex, NULL);
+    char* defaultPrefixStr = "*";
+    const char* prefixStr = defaultPrefixStr;
+    PyObject* prefix = GearsPyDict_GetItemString(kargs, "prefix");
+    if(prefix){
+        if(PyUnicode_Check(prefix)){
+            prefixStr = PyUnicode_AsUTF8AndSize(prefix, NULL);
         }else{
             PyErr_SetString(GearsError, "regex argument must be a string");
             return NULL;
         }
     }
 
-    if (strcmp(reader, "KeysReader") == 0 ||
-            strcmp(reader, "KeysOnlyReader") == 0) {
-        return registerCreateKeysArgs(kargs, regexStr, mode);
+    if (strcmp(reader, "KeysReader") == 0){
+        return registerCreateKeysArgs(kargs, prefixStr, mode);
     }else if (strcmp(reader, "StreamReader") == 0){
-        return registerCreateStreamArgs(kargs, regexStr, mode);
+        return registerCreateStreamArgs(kargs, prefixStr, mode);
     }
     PyErr_SetString(GearsError, "given reader does not exists or does not support register");
     return NULL;
@@ -1093,7 +1200,7 @@ static PyObject* registerExecution(PyObject *self, PyObject *args, PyObject *kar
         return NULL;
     }
 
-    PyObject* pymode = PyDict_GetItemString(kargs, "mode");
+    PyObject* pymode = GearsPyDict_GetItemString(kargs, "mode");
     ExecutionMode mode = ExecutionModeAsync;
     if(pymode){
         if(PyUnicode_Check(pymode)){
@@ -1114,7 +1221,7 @@ static PyObject* registerExecution(PyObject *self, PyObject *args, PyObject *kar
         }
     }
 
-    PyObject* onRegistered = PyDict_GetItemString(kargs, "OnRegistered");
+    PyObject* onRegistered = GearsPyDict_GetItemString(kargs, "onRegistered");
     if(onRegistered && onRegistered != Py_None){
         if(!PyFunction_Check(onRegistered)){
             PyErr_SetString(GearsError, "OnRegistered argument must be a function");
@@ -1142,7 +1249,6 @@ static PyObject* registerExecution(PyObject *self, PyObject *args, PyObject *kar
         }else{
             PyErr_SetString(GearsError, "Failed register execution");
         }
-        registerFreeArgs(pfep->fep, executionArgs);
         return NULL;
     }
 
@@ -1158,6 +1264,7 @@ typedef struct PyAtomic{
 static PyObject* atomicEnter(PyObject *self, PyObject *args){
     PyAtomic* pyAtomic = (PyAtomic*)self;
     LockHandler_Acquire(pyAtomic->ctx);
+    RedisModule_Replicate(pyAtomic->ctx, "multi", "");
     Py_INCREF(self);
     return self;
 }
@@ -1165,6 +1272,7 @@ static PyObject* atomicEnter(PyObject *self, PyObject *args){
 static PyObject* atomicExit(PyObject *self, PyObject *args){
     PyAtomic* pyAtomic = (PyAtomic*)self;
     LockHandler_Release(pyAtomic->ctx);
+    RedisModule_Replicate(pyAtomic->ctx, "exec", "");
     Py_INCREF(self);
     return self;
 }
@@ -1194,7 +1302,7 @@ PyMethodDef PyFlatExecutionMethods[] = {
     {"flatmap", flatmap, METH_VARARGS, "flat map a record to many records"},
     {"limit", limit, METH_VARARGS, "limit the results to a give size and offset"},
     {"accumulate", accumulate, METH_VARARGS, "accumulate the records to a single record"},
-    {"run", run, METH_VARARGS, "start the execution"},
+    {"run", (PyCFunction)run, METH_VARARGS|METH_KEYWORDS, "start the execution"},
     {"register", (PyCFunction)registerExecution, METH_VARARGS|METH_KEYWORDS, "register the execution on an event"},
     {NULL, NULL, 0, NULL}
 };
@@ -1389,14 +1497,15 @@ static PyObject* RedisConfigGet(PyObject *cls, PyObject *args){
     return valPyStr;
 }
 
-static PyObject* RedisLog(PyObject *cls, PyObject *args){
-    PyObject* logLevel = NULL;
+static PyObject* RedisLog(PyObject *cls, PyObject *args, PyObject *kargs){
+    PyObject* logLevel = GearsPyDict_GetItemString(kargs, "level");
     PyObject* logMsg = NULL;
     if(PyTuple_Size(args) < 1 || PyTuple_Size(args) > 2){
         PyErr_SetString(GearsError, "log function must get a log message as input");
         return NULL;
     }
     if(PyTuple_Size(args) == 2){
+        RedisModule_Log(NULL, "warning", "Specify log level as the first argument to log function is depricated, use key argument 'level' instead");
         logLevel = PyTuple_GetItem(args, 0);
         logMsg = PyTuple_GetItem(args, 1);
     }else{
@@ -2131,7 +2240,7 @@ PyMethodDef EmbRedisGearsMethods[] = {
     {"atomicCtx", atomicCtx, METH_VARARGS, "creating a atomic ctx for atomic block"},
     {"_saveGlobals", saveGlobals, METH_VARARGS, "should not be use"},
     {"executeCommand", executeCommand, METH_VARARGS, "execute a redis command and return the result"},
-    {"log", RedisLog, METH_VARARGS, "write a message into the redis log file"},
+    {"log", (PyCFunction)RedisLog, METH_VARARGS|METH_KEYWORDS, "write a message into the redis log file"},
     {"config_get", RedisConfigGet, METH_VARARGS, "write a message into the redis log file"},
     {"getMyHashTag", getMyHashTag, METH_VARARGS, "return hash tag of the current node or None if not running on cluster"},
     {"registerTimeEvent", gearsTimeEvent, METH_VARARGS, "register a function to be called on each time period"},
@@ -2262,14 +2371,121 @@ static void RedisGearsPy_GetRequirementsList(const char** requirementsList, Redi
     }
 }
 
+typedef struct BackgroundDepsInstallCtx{
+    PythonSessionCtx* session;
+    RedisModuleBlockedClient *bc;
+    char* script;
+    DoneCallbackFunction doneFunction;
+}BackgroundDepsInstallCtx;
+
+static Gears_threadpool installDepsPool = NULL;
+
+static void RedisGearsPy_InnerExecute(RedisModuleCtx* rctx, BackgroundDepsInstallCtx* bdiCtx, bool isBlocking){
+    PythonThreadCtx* ptctx = GetPythonThreadCtx();
+    ptctx->currentCtx = rctx;
+    ptctx->createdExecution = NULL;
+
+    void* old = RedisGearsPy_Lock(bdiCtx->session);
+    PyObject *v = PyRun_StringFlags(bdiCtx->script, Py_file_input, ptctx->currSession->globalsDict, ptctx->currSession->globalsDict, NULL);
+
+    if(!v){
+        char* err = getPyError();
+        if(!err){
+            RedisModule_ReplyWithError(rctx, "failed running the given script");
+        }else{
+            RedisModule_ReplyWithError(rctx, err);
+            RG_FREE(err);
+        }
+
+        if(ptctx->createdExecution){
+            // error occured, we need to abort the created execution.
+            int res = RedisGears_AbortExecution(ptctx->createdExecution);
+            assert(res == REDISMODULE_OK);
+            RedisGears_DropExecution(ptctx->createdExecution);
+        }
+
+        RedisGearsPy_Unlock(old);
+
+        ptctx->createdExecution = NULL;
+        ptctx->currentCtx = NULL;
+        return;
+    }
+
+    if(ptctx->createdExecution){
+        if(isBlocking){
+            RedisModuleBlockedClient* bc = bdiCtx->bc;
+            bdiCtx->bc = NULL; // we are taking ownership of the blocked client
+            if(!bc){
+                bc = RedisModule_BlockClient(ptctx->currentCtx, NULL, NULL, NULL, 0);
+            }
+            RedisGears_AddOnDoneCallback(ptctx->createdExecution, bdiCtx->doneFunction, bc);
+        }else{
+            const char* id = RedisGears_GetId(ptctx->createdExecution);
+            RedisModule_ReplyWithStringBuffer(rctx, id, strlen(id));
+        }
+    }else{
+        RedisModule_ReplyWithSimpleString(ptctx->currentCtx, "OK");
+    }
+    RedisGearsPy_Unlock(old);
+
+    ptctx->createdExecution = NULL;
+    ptctx->currentCtx = NULL;
+}
+
+static void RedisGearsPy_InstallDepsAndExecute(void* ctx){
+    BackgroundDepsInstallCtx* bdiCtx = ctx;
+    RedisModuleCtx* rctx = RedisModule_GetThreadSafeContext(bdiCtx->bc);
+    if(!PythonSessionCtx_DownloadAndInstallDeps(bdiCtx->session)){
+        RedisModule_ReplyWithError(rctx, "Could not satisfy requirments (look at redis log file for more information)");
+        LockHandler_Acquire(rctx);
+        goto done;
+    }
+
+    LockHandler_Acquire(rctx);
+    RedisGearsPy_InnerExecute(rctx, bdiCtx, true);
+
+done:
+    // free bdiCtx
+
+    PythonSessionCtx_Free(bdiCtx->session);
+    RG_FREE(bdiCtx->script);
+    if(bdiCtx->bc){
+        RedisModule_UnblockClient(bdiCtx->bc, NULL);
+    }
+    RG_FREE(bdiCtx);
+
+    LockHandler_Release(rctx);
+    RedisModule_FreeThreadSafeContext(rctx);
+}
+
+static void RedisGearsPy_BackgroundExecute(PythonSessionCtx* session,
+                                    RedisModuleBlockedClient *bc,
+                                    const char* script,
+                                    DoneCallbackFunction doneFunction){
+    BackgroundDepsInstallCtx* bdiCtx = RG_ALLOC(sizeof(*bdiCtx));
+    *bdiCtx = (BackgroundDepsInstallCtx){
+            .session = session,
+            .bc = bc,
+            .script = RG_STRDUP(script),
+            doneFunction = doneFunction,
+    };
+
+    Gears_thpool_add_work(installDepsPool, RedisGearsPy_InstallDepsAndExecute, bdiCtx);
+}
+
 int RedisGearsPy_Execute(RedisModuleCtx *ctx, RedisModuleString **argv, int argc){
+    int ctxFlags = RedisModule_GetContextFlags(ctx);
+
+    if(ctxFlags & (REDISMODULE_CTX_FLAGS_LUA|REDISMODULE_CTX_FLAGS_MULTI)){
+        RedisModule_ReplyWithError(ctx, "Can not run gear inside multi exec or lua");
+        return REDISMODULE_OK;
+    }
+
     if(argc < 2){
         return RedisModule_WrongArity(ctx);
     }
 
     const char* script = RedisModule_StringPtrLen(argv[1], NULL);
-    PythonThreadCtx* ptctx = GetPythonThreadCtx();
-    ptctx->currentCtx = ctx;
     bool isBlocking = true;
     size_t requirementsArg = 3;
     if(argc >= 3){
@@ -2289,59 +2505,30 @@ int RedisGearsPy_Execute(RedisModuleCtx *ctx, RedisModuleString **argv, int argc
         }
     }
 
-    ptctx->createdExecution = NULL;
-
-    PyObject *v;
-
     PythonSessionCtx* session = PythonSessionCtx_Create(requirementsList, reqLen);
     if(!session){
-        RedisModule_ReplyWithError(ctx, "Could not satisfy requirments");
-        ptctx->createdExecution = NULL;
-        ptctx->currentCtx = NULL;
-        return REDISMODULE_OK;
-    }
-    void* old = RedisGearsPy_Lock(session);
-    v = PyRun_StringFlags(script, Py_file_input, ptctx->currSession->globalsDict, ptctx->currSession->globalsDict, NULL);
-    PythonSessionCtx_Free(ptctx->currSession);
-
-    if(!v){
-        char* err = getPyError();
-        if(!err){
-            RedisModule_ReplyWithError(ctx, "failed running the given script");
-        }else{
-            RedisModule_ReplyWithError(ctx, err);
-            RG_FREE(err);
-        }
-
-        if(ptctx->createdExecution){
-            // error occured, we need to abort the created execution.
-            int res = RedisGears_AbortExecution(ptctx->createdExecution);
-            assert(res == REDISMODULE_OK);
-            RedisGears_DropExecution(ptctx->createdExecution);
-        }
-
-        RedisGearsPy_Unlock(old);
-
-        ptctx->createdExecution = NULL;
-        ptctx->currentCtx = NULL;
+        RedisModule_ReplyWithError(ctx, "Could not satisfy requirments, look at the log file for more information.");
         return REDISMODULE_OK;
     }
 
-    if(ptctx->createdExecution){
-        if(isBlocking){
-            RedisModuleBlockedClient *bc = RedisModule_BlockClient(ptctx->currentCtx, NULL, NULL, NULL, 1000000);
-            RedisGears_AddOnDoneCallback(ptctx->createdExecution, ptctx->doneFunction, bc);
-        }else{
-            const char* id = RedisGears_GetId(ptctx->createdExecution);
-            RedisModule_ReplyWithStringBuffer(ctx, id, strlen(id));
-        }
-    }else{
-        RedisModule_ReplyWithSimpleString(ptctx->currentCtx, "OK");
-    }
-    RedisGearsPy_Unlock(old);
+    PythonThreadCtx* ptctx = GetPythonThreadCtx();
 
-    ptctx->createdExecution = NULL;
-    ptctx->currentCtx = NULL;
+    if(session->isInstallationNeeded){
+        RedisModuleBlockedClient *bc = RedisModule_BlockClient(ctx, NULL, NULL, NULL, 0);
+        RedisGearsPy_BackgroundExecute(session, bc, script, ptctx->doneFunction);
+        return REDISMODULE_OK;
+    }
+
+    BackgroundDepsInstallCtx bdiCtx = (BackgroundDepsInstallCtx){
+            .session = session,
+            .bc = NULL,
+            .script = (char*)script,
+            .doneFunction = ptctx->doneFunction,
+    };
+
+    RedisGearsPy_InnerExecute(ctx, &bdiCtx, isBlocking);
+
+    PythonSessionCtx_Free(session);
 
     return REDISMODULE_OK;
 }
@@ -2356,6 +2543,9 @@ int RedisGearsPy_ExecuteWithCallback(RedisModuleCtx *ctx, RedisModuleString **ar
 }
 
 char* getPyError() {
+    if(!PyErr_Occurred()){
+        return NULL;
+    }
     PyObject *pType, *pValue, *pTraceback;
     PyErr_Fetch(&pType, &pValue, &pTraceback);
     PyErr_NormalizeException(&pType, &pValue, &pTraceback);
@@ -2391,8 +2581,12 @@ char* getPyError() {
     char* err =  RG_STRDUP(strTraceback);
     Py_DECREF(pStrTraceback);
     Py_DECREF(pModuleName);
-    Py_DECREF(pType);
-    Py_DECREF(pValue);
+    if(pType){
+        Py_DECREF(pType);
+    }
+    if(pValue){
+        Py_DECREF(pValue);
+    }
     if(pTraceback){
         Py_DECREF(pTraceback);
     }
@@ -2405,7 +2599,7 @@ void fetchPyError(ExecutionCtx* rctx) {
 
 void RedisGearsPy_PyCallbackForEach(ExecutionCtx* rctx, Record *record, void* arg){
     // Call Python/C API functions...
-    assert(RedisGears_RecordGetType(record) == PY_RECORD);
+    assert(RedisGears_RecordGetType(record) == pythonRecordType);
 
     PythonSessionCtx* sctx = RedisGears_GetFlatExecutionPrivateData(rctx);
     assert(sctx);
@@ -2414,7 +2608,7 @@ void RedisGearsPy_PyCallbackForEach(ExecutionCtx* rctx, Record *record, void* ar
 
     PyObject* pArgs = PyTuple_New(1);
     PyObject* callback = arg;
-    PyObject* obj = RG_PyObjRecordGet(record);
+    PyObject* obj = PyObjRecordGet(record);
     Py_INCREF(obj);
     PyTuple_SetItem(pArgs, 0, obj);
     PyObject* ret = PyObject_CallObject(callback, pArgs);
@@ -2442,15 +2636,15 @@ static Record* RedisGearsPy_PyCallbackAccumulateByKey(ExecutionCtx* rctx, char* 
 
 	PyObject* pArgs = PyTuple_New(3);
 	PyObject* callback = arg;
-	PyObject* currObj = RG_PyObjRecordGet(r);
+	PyObject* currObj = PyObjRecordGet(r);
 	PyObject* keyPyStr = PyUnicode_FromString(key);
-	RG_PyObjRecordSet(r, NULL);
+	PyObjRecordSet(r, NULL);
 	PyObject* oldAccumulateObj = Py_None;
 	Py_INCREF(oldAccumulateObj);
 	if(!accumulate){
-		accumulate = RG_PyObjRecordCreate();
+		accumulate = PyObjRecordCreate();
 	}else{
-		oldAccumulateObj = RG_PyObjRecordGet(accumulate);
+		oldAccumulateObj = PyObjRecordGet(accumulate);
 	}
 	PyTuple_SetItem(pArgs, 0, keyPyStr);
 	PyTuple_SetItem(pArgs, 1, oldAccumulateObj);
@@ -2465,7 +2659,7 @@ static Record* RedisGearsPy_PyCallbackAccumulateByKey(ExecutionCtx* rctx, char* 
         RedisGears_FreeRecord(r);
 		return NULL;
 	}
-	RG_PyObjRecordSet(accumulate, newAccumulateObj);
+	PyObjRecordSet(accumulate, newAccumulateObj);
 
 	RedisGearsPy_Unlock(old);
     RedisGears_FreeRecord(r);
@@ -2481,14 +2675,14 @@ static Record* RedisGearsPy_PyCallbackAccumulate(ExecutionCtx* rctx, Record *acc
 
     PyObject* pArgs = PyTuple_New(2);
     PyObject* callback = arg;
-    PyObject* currObj = RG_PyObjRecordGet(r);
-    RG_PyObjRecordSet(r, NULL);
+    PyObject* currObj = PyObjRecordGet(r);
+    PyObjRecordSet(r, NULL);
     PyObject* oldAccumulateObj = Py_None;
     Py_INCREF(oldAccumulateObj);
     if(!accumulate){
-        accumulate = RG_PyObjRecordCreate();
+        accumulate = PyObjRecordCreate();
     }else{
-        oldAccumulateObj = RG_PyObjRecordGet(accumulate);
+        oldAccumulateObj = PyObjRecordGet(accumulate);
     }
     PyTuple_SetItem(pArgs, 0, oldAccumulateObj);
     PyTuple_SetItem(pArgs, 1, currObj);
@@ -2502,7 +2696,7 @@ static Record* RedisGearsPy_PyCallbackAccumulate(ExecutionCtx* rctx, Record *acc
         RedisGears_FreeRecord(r);
         return NULL;
     }
-    RG_PyObjRecordSet(accumulate, newAccumulateObj);
+    PyObjRecordSet(accumulate, newAccumulateObj);
 
     RedisGearsPy_Unlock(old);
 
@@ -2511,7 +2705,7 @@ static Record* RedisGearsPy_PyCallbackAccumulate(ExecutionCtx* rctx, Record *acc
 }
 
 static Record* RedisGearsPy_PyCallbackMapper(ExecutionCtx* rctx, Record *record, void* arg){
-    assert(RedisGears_RecordGetType(record) == PY_RECORD);
+    assert(RedisGears_RecordGetType(record) == pythonRecordType);
 
     PythonSessionCtx* sctx = RedisGears_GetFlatExecutionPrivateData(rctx);
     assert(sctx);
@@ -2520,7 +2714,7 @@ static Record* RedisGearsPy_PyCallbackMapper(ExecutionCtx* rctx, Record *record,
 
     PyObject* pArgs = PyTuple_New(1);
     PyObject* callback = arg;
-    PyObject* oldObj = RG_PyObjRecordGet(record);
+    PyObject* oldObj = PyObjRecordGet(record);
     PyTuple_SetItem(pArgs, 0, oldObj);
     PyObject* newObj = PyObject_CallObject(callback, pArgs);
     Py_DECREF(pArgs);
@@ -2531,7 +2725,7 @@ static Record* RedisGearsPy_PyCallbackMapper(ExecutionCtx* rctx, Record *record,
         RedisGears_FreeRecord(record);
         return NULL;
     }
-    RG_PyObjRecordSet(record, newObj);
+    PyObjRecordSet(record, newObj);
 
     RedisGearsPy_Unlock(old);
     return record;
@@ -2539,7 +2733,7 @@ static Record* RedisGearsPy_PyCallbackMapper(ExecutionCtx* rctx, Record *record,
 
 static Record* RedisGearsPy_PyCallbackFlatMapper(ExecutionCtx* rctx, Record *record, void* arg){
     // Call Python/C API functions...
-    assert(RedisGears_RecordGetType(record) == PY_RECORD);
+    assert(RedisGears_RecordGetType(record) == pythonRecordType);
 
     PythonSessionCtx* sctx = RedisGears_GetFlatExecutionPrivateData(rctx);
     assert(sctx);
@@ -2548,8 +2742,8 @@ static Record* RedisGearsPy_PyCallbackFlatMapper(ExecutionCtx* rctx, Record *rec
 
     PyObject* pArgs = PyTuple_New(1);
     PyObject* callback = arg;
-    PyObject* oldObj = RG_PyObjRecordGet(record);
-    RG_PyObjRecordSet(record, NULL);
+    PyObject* oldObj = PyObjRecordGet(record);
+    PyObjRecordSet(record, NULL);
     PyTuple_SetItem(pArgs, 0, oldObj);
     PyObject* newObj = PyObject_CallObject(callback, pArgs);
     Py_DECREF(pArgs);
@@ -2566,14 +2760,14 @@ static Record* RedisGearsPy_PyCallbackFlatMapper(ExecutionCtx* rctx, Record *rec
         record = RedisGears_ListRecordCreate(len);
         for(size_t i = 0 ; i < len ; ++i){
             PyObject* temp = PyList_GetItem(newObj, i);
-            Record* pyRecord = RG_PyObjRecordCreate();
+            Record* pyRecord = PyObjRecordCreate();
             Py_INCREF(temp);
-            RG_PyObjRecordSet(pyRecord, temp);
+            PyObjRecordSet(pyRecord, temp);
             RedisGears_ListRecordAdd(record, pyRecord);
         }
         Py_DECREF(newObj);
     }else{
-        RG_PyObjRecordSet(record, newObj);
+        PyObjRecordSet(record, newObj);
     }
 
     RedisGearsPy_Unlock(old);
@@ -2581,7 +2775,7 @@ static Record* RedisGearsPy_PyCallbackFlatMapper(ExecutionCtx* rctx, Record *rec
 }
 
 static bool RedisGearsPy_PyCallbackFilter(ExecutionCtx* rctx, Record *record, void* arg){
-    assert(RedisGears_RecordGetType(record) == PY_RECORD);
+    assert(RedisGears_RecordGetType(record) == pythonRecordType);
 
     PythonSessionCtx* sctx = RedisGears_GetFlatExecutionPrivateData(rctx);
     assert(sctx);
@@ -2590,7 +2784,7 @@ static bool RedisGearsPy_PyCallbackFilter(ExecutionCtx* rctx, Record *record, vo
 
     PyObject* pArgs = PyTuple_New(1);
     PyObject* callback = arg;
-    PyObject* obj = RG_PyObjRecordGet(record);
+    PyObject* obj = PyObjRecordGet(record);
     Py_INCREF(obj);
     PyTuple_SetItem(pArgs, 0, obj);
     PyObject* ret = PyObject_CallObject(callback, pArgs);
@@ -2608,7 +2802,7 @@ static bool RedisGearsPy_PyCallbackFilter(ExecutionCtx* rctx, Record *record, vo
 }
 
 static char* RedisGearsPy_PyCallbackExtractor(ExecutionCtx* rctx, Record *record, void* arg, size_t* len){
-    assert(RedisGears_RecordGetType(record) == PY_RECORD);
+    assert(RedisGears_RecordGetType(record) == pythonRecordType);
 
     PythonSessionCtx* sctx = RedisGears_GetFlatExecutionPrivateData(rctx);
     assert(sctx);
@@ -2617,7 +2811,7 @@ static char* RedisGearsPy_PyCallbackExtractor(ExecutionCtx* rctx, Record *record
 
     PyObject* extractor = arg;
     PyObject* pArgs = PyTuple_New(1);
-    PyObject* obj = RG_PyObjRecordGet(record);
+    PyObject* obj = PyObjRecordGet(record);
     Py_INCREF(obj);
     PyTuple_SetItem(pArgs, 0, obj);
     PyObject* ret = PyObject_CallObject(extractor, pArgs);
@@ -2648,7 +2842,7 @@ static char* RedisGearsPy_PyCallbackExtractor(ExecutionCtx* rctx, Record *record
 }
 
 static Record* RedisGearsPy_PyCallbackReducer(ExecutionCtx* rctx, char* key, size_t keyLen, Record *records, void* arg){
-    assert(RedisGears_RecordGetType(records) == LIST_RECORD);
+    assert(RedisGears_RecordGetType(records) == listRecordType);
 
     PythonSessionCtx* sctx = RedisGears_GetFlatExecutionPrivateData(rctx);
     assert(sctx);
@@ -2658,8 +2852,8 @@ static Record* RedisGearsPy_PyCallbackReducer(ExecutionCtx* rctx, char* key, siz
     PyObject* obj = PyList_New(0);
     for(size_t i = 0 ; i < RedisGears_ListRecordLen(records) ; ++i){
         Record* r = RedisGears_ListRecordGet(records, i);
-        assert(RedisGears_RecordGetType(r) == PY_RECORD);
-        PyObject* element = RG_PyObjRecordGet(r);
+        assert(RedisGears_RecordGetType(r) == pythonRecordType);
+        PyObject* element = PyObjRecordGet(r);
         PyList_Append(obj, element);
     }
     PyObject* reducer = arg;
@@ -2676,8 +2870,8 @@ static Record* RedisGearsPy_PyCallbackReducer(ExecutionCtx* rctx, char* key, siz
         RedisGears_FreeRecord(records);
         return NULL;
     }
-    Record* retRecord = RG_PyObjRecordCreate();
-    RG_PyObjRecordSet(retRecord, ret);
+    Record* retRecord = PyObjRecordCreate();
+    PyObjRecordSet(retRecord, ret);
 
     RedisGearsPy_Unlock(old);
     RedisGears_FreeRecord(records);
@@ -2685,7 +2879,7 @@ static Record* RedisGearsPy_PyCallbackReducer(ExecutionCtx* rctx, char* key, siz
 }
 
 static Record* RedisGearsPy_ToPyRecordMapperInternal(Record *record, void* arg){
-    Record* res = RG_PyObjRecordCreate();
+    Record* res = PyObjRecordCreate();
     Record* tempRecord;
     PyObject* obj;
     PyObject* temp;
@@ -2695,8 +2889,12 @@ static Record* RedisGearsPy_ToPyRecordMapperInternal(Record *record, void* arg){
     char* key;
     Arr(char*) keys;
     size_t len;
-    switch(RedisGears_RecordGetType(record)){
-    case STRING_RECORD:
+    if(!record){
+        Py_INCREF(Py_None);
+        PyObjRecordSet(res, Py_None);
+        return res;
+    }
+    if(RedisGears_RecordGetType(record) == stringRecordType){
         str = RedisGears_StringRecordGet(record, &len);
         // try to first decode it as string, if fails create a byte array.
         obj = PyUnicode_FromStringAndSize(str, len);
@@ -2704,16 +2902,13 @@ static Record* RedisGearsPy_ToPyRecordMapperInternal(Record *record, void* arg){
             PyErr_Clear();
             obj = PyByteArray_FromStringAndSize(str, len);
         }
-        break;
-    case LONG_RECORD:
+    }else if(RedisGears_RecordGetType(record) == longRecordType){
         longNum = RedisGears_LongRecordGet(record);
         obj = PyLong_FromLong(longNum);
-        break;
-    case DOUBLE_RECORD:
+    }else if(RedisGears_RecordGetType(record) == doubleRecordType){
         doubleNum = RedisGears_DoubleRecordGet(record);
         obj = PyLong_FromDouble(doubleNum);
-        break;
-    case KEY_RECORD:
+    }else if(RedisGears_RecordGetType(record) == keyRecordType){
         key = RedisGears_KeyRecordGetKey(record, NULL);
         obj = PyDict_New();
         temp = PyUnicode_FromString(key);
@@ -2722,26 +2917,23 @@ static Record* RedisGearsPy_ToPyRecordMapperInternal(Record *record, void* arg){
         tempRecord = RedisGears_KeyRecordGetVal(record);
         if(tempRecord){
             tempRecord = RedisGearsPy_ToPyRecordMapperInternal(tempRecord, arg);
-            assert(RedisGears_RecordGetType(tempRecord) == PY_RECORD);
-            PyDict_SetItemString(obj, "value", RG_PyObjRecordGet(tempRecord));
+            assert(RedisGears_RecordGetType(tempRecord) == pythonRecordType);
+            PyDict_SetItemString(obj, "value", PyObjRecordGet(tempRecord));
             RedisGears_FreeRecord(tempRecord);
         }else{
             Py_INCREF(Py_None);
             PyDict_SetItemString(obj, "value", Py_None);
         }
-
-        break;
-    case LIST_RECORD:
+    }else if(RedisGears_RecordGetType(record) == listRecordType){
         len = RedisGears_ListRecordLen(record);
         obj = PyList_New(0);
         for(size_t i = 0 ; i < len ; ++i){
             tempRecord = RedisGearsPy_ToPyRecordMapperInternal(RedisGears_ListRecordGet(record, i), arg);
-            assert(RedisGears_RecordGetType(tempRecord) == PY_RECORD);
-            PyList_Append(obj, RG_PyObjRecordGet(tempRecord));
+            assert(RedisGears_RecordGetType(tempRecord) == pythonRecordType);
+            PyList_Append(obj, PyObjRecordGet(tempRecord));
             RedisGears_FreeRecord(tempRecord);
         }
-        break;
-    case HASH_SET_RECORD:
+    }else if(RedisGears_RecordGetType(record) == hashSetRecordType){
         keys = RedisGears_HashSetRecordGetAllKeys(record);
         obj = PyDict_New();
         for(size_t i = 0 ; i < array_len(keys) ; ++i){
@@ -2749,21 +2941,19 @@ static Record* RedisGearsPy_ToPyRecordMapperInternal(Record *record, void* arg){
             temp = PyUnicode_FromString(key);
             tempRecord = RedisGears_HashSetRecordGet(record, key);
             tempRecord = RedisGearsPy_ToPyRecordMapperInternal(tempRecord, arg);
-            assert(RedisGears_RecordGetType(tempRecord) == PY_RECORD);
-            PyDict_SetItem(obj, temp, RG_PyObjRecordGet(tempRecord));
+            assert(RedisGears_RecordGetType(tempRecord) == pythonRecordType);
+            PyDict_SetItem(obj, temp, PyObjRecordGet(tempRecord));
             Py_DECREF(temp);
             RedisGears_FreeRecord(tempRecord);
         }
         array_free(keys);
-        break;
-    case PY_RECORD:
-        obj = RG_PyObjRecordGet(record);
+    }else if(RedisGears_RecordGetType(record) == pythonRecordType){
+        obj = PyObjRecordGet(record);
         Py_INCREF(obj);
-        break;
-    default:
+    }else{
         assert(false);
     }
-    RG_PyObjRecordSet(res, obj);
+    PyObjRecordSet(res, obj);
     return res;
 }
 
@@ -2976,10 +3166,14 @@ static int RedisGearsPy_Stats(RedisModuleCtx *ctx, RedisModuleString **argv, int
 typedef struct PythonReaderCtx{
     PyObject* callback;
     PyObject* generator;
+    bool isDone;
 }PythonReaderCtx;
 
 static Record* PythonReader_Next(ExecutionCtx* rctx, void* ctx){
     PythonReaderCtx* pyCtx = ctx;
+    if(pyCtx->isDone){
+        return NULL;
+    }
 
     PythonSessionCtx* sctx = RedisGears_GetFlatExecutionPrivateData(rctx);
     assert(sctx);
@@ -2992,6 +3186,12 @@ static Record* PythonReader_Next(ExecutionCtx* rctx, void* ctx){
         PyObject* callback = pyCtx->callback;
         pyRecord = PyObject_CallObject(callback, pArgs);
         Py_DECREF(pArgs);
+        if(!pyRecord){
+            fetchPyError(rctx);
+            RedisGearsPy_Unlock(old);
+            pyCtx->isDone = true;
+            return NULL;
+        }
         if(PyGen_Check(pyRecord)) {
             pyCtx->generator = PyObject_GetIter(pyRecord);
             Py_DECREF(pyRecord);
@@ -3000,13 +3200,15 @@ static Record* PythonReader_Next(ExecutionCtx* rctx, void* ctx){
     }else{
         pyRecord = PyIter_Next(pyCtx->generator);
     }
-    if(pyRecord == Py_None || pyRecord == NULL){
+    if(!pyRecord){
+        fetchPyError(rctx);
         RedisGearsPy_Unlock(old);
+        pyCtx->isDone = true;
         return NULL;
     }
     RedisGearsPy_Unlock(old);
-    Record* record = RG_PyObjRecordCreate();
-    RG_PyObjRecordSet(record, pyRecord);
+    Record* record = PyObjRecordCreate();
+    PyObjRecordSet(record, pyRecord);
     return record;
 }
 
@@ -3044,6 +3246,7 @@ static Reader* PythonReader_Create(void* arg){
     PythonReaderCtx* pyCtx = RG_ALLOC(sizeof(*pyCtx));
     pyCtx->callback = callback;
     pyCtx->generator = NULL;
+    pyCtx->isDone = false;
     Reader* ret = RG_ALLOC(sizeof(*ret));
     *ret = (Reader){
             .ctx = pyCtx,
@@ -3059,17 +3262,15 @@ RedisGears_ReaderCallbacks PythonReader = {
         .create = PythonReader_Create,
 };
 
-#define PYENV_INSTALL_DIR "/var/opt/redislabs/lib/modules/"
-#define PYENV_DIR PYENV_INSTALL_DIR"python3"
-#define PYENV_HOME_DIR PYENV_DIR "/.venv"
-#define PYENV_BIN_DIR PYENV_HOME_DIR "/bin"
-#define PYENV_ACTIVATE PYENV_HOME_DIR "/activate_this.py"
-#define PYENV_ACTIVATE_SCRIPT PYENV_BIN_DIR "/activate"
+static char* PYINSTALL_DIR;
+static char* PYENV_DIR;
+static char* PYENV_HOME_DIR;
+static char* PYENV_BIN_DIR;
+static char* PYENV_ACTIVATE;
+static char* PYENV_ACTIVATE_SCRIPT;
 
-
-
-bool PyEnvExist() {
-    DIR* dir = opendir(PYENV_DIR);
+static bool PathExist(const char* path) {
+    DIR* dir = opendir(path);
     if (dir) {
         closedir(dir);
         return true;
@@ -3077,32 +3278,77 @@ bool PyEnvExist() {
     return false;
 }
 
+static bool PyEnvExist() {
+    return PathExist(PYENV_DIR);
+}
+
+static void InitializeGlobalPaths(){
+    const char* moduleDataDir = getenv("modulesdatadir");
+    if(moduleDataDir){
+        // modulesdatadir env var exists, we are running on redis enterprise and we need to run on modules directory
+        rg_asprintf(&PYINSTALL_DIR, "%s/%s/%d/deps/", moduleDataDir, REDISGEARS_MODULE_NAME, REDISGEARS_MODULE_VERSION);
+    }else{
+        // try build path first if its exists
+#ifdef CPYTHON_PATH
+        rg_asprintf(&PYINSTALL_DIR, "%s/", CPYTHON_PATH);
+
+        // we create it temporary to check if exists
+        rg_asprintf(&PYENV_DIR, "%s/python3_%s/", PYINSTALL_DIR, REDISGEARS_VERSION_STR);
+
+        if(!PyEnvExist()){
+            RG_FREE(PYINSTALL_DIR);
+            rg_asprintf(&PYINSTALL_DIR, "%s/", GearsConfig_GetPythonInstallationDir());
+        }
+
+        RG_FREE(PYENV_DIR);
+#else
+        rg_asprintf(&PYINSTALL_DIR, "%s/", GearsConfig_GetPythonInstallationDir());
+#endif
+
+    }
+    rg_asprintf(&PYENV_DIR, "%s/python3_%s/", PYINSTALL_DIR, REDISGEARS_VERSION_STR);
+    rg_asprintf(&PYENV_HOME_DIR, "%s/.venv/", PYENV_DIR);
+    rg_asprintf(&PYENV_BIN_DIR, "%s/bin", PYENV_HOME_DIR);
+    rg_asprintf(&PYENV_ACTIVATE, "%s/activate_this.py", PYENV_BIN_DIR);
+    rg_asprintf(&PYENV_ACTIVATE_SCRIPT, "%s/activate", PYENV_BIN_DIR);
+}
+
+static void PrintGlobalPaths(RedisModuleCtx* ctx){
+    RedisModule_Log(ctx, "notice", "PYENV_DIR: %s", PYENV_DIR);
+    RedisModule_Log(ctx, "notice", "PYENV_HOME_DIR: %s", PYENV_HOME_DIR);
+    RedisModule_Log(ctx, "notice", "PYENV_BIN_DIR: %s", PYENV_BIN_DIR);
+    RedisModule_Log(ctx, "notice", "PYENV_ACTIVATE: %s", PYENV_ACTIVATE);
+    RedisModule_Log(ctx, "notice", "PYENV_ACTIVATE_SCRIPT: %s", PYENV_ACTIVATE_SCRIPT);
+}
+
 static int RedisGears_InstallDeps(RedisModuleCtx *ctx) {
-#define SHA_256_SIZE 64
-#define DEPS_FILE_PATH "/tmp/deps.%s.%s.tgz"
-#define DEPS_FILE_DIR "/tmp/deps.%s.%s/"
-#define LOCAL_VENV PYENV_DIR"/%s"
+#define SHA_256_SIZE            64
+#define TMP_DEPS_FILE_PATH_FMT  "/tmp/deps.%s.%s.tgz"
+#define TMP_DEPS_FILE_DIR_FMT   "/tmp/deps.%s.%s/"
+#define LOCAL_VENV_FMT          PYENV_DIR"/%s"
+
     const char *no_deps = getenv("GEARS_NO_DEPS");
-    bool skip_deps_install = no_deps && !strcmp(no_deps, "1");
+    bool skip_deps_install = (no_deps && !strcmp(no_deps, "1")) || !GearsConfig_DownloadDeps() ||
+                             (IsEnterprise() && !GearsConfig_ForceDownloadDepsOnEnterprise());
     const char* shardUid = GetShardUniqueId();
     if (!PyEnvExist()){
         if (skip_deps_install) {
-            RedisModule_Log(ctx, "warning", "No Python installation found and GEARS_NO_DEPS=1: aborting");
+            RedisModule_Log(ctx, "warning", "No Python installation found and auto install is not enabled, aborting.");
             return REDISMODULE_ERR;
         }
         const char* expectedSha256 = GearsConfig_GetDependenciesSha256();
 
-        ExecCommand(ctx, "rm -rf "DEPS_FILE_PATH, shardUid, expectedSha256);
+        ExecCommand(ctx, "rm -rf "TMP_DEPS_FILE_PATH_FMT, shardUid, expectedSha256);
 
-        ExecCommand(ctx, "curl -o "DEPS_FILE_PATH" %s", shardUid, expectedSha256, GearsConfig_GetDependenciesUrl());
+        ExecCommand(ctx, "curl -o "TMP_DEPS_FILE_PATH_FMT" %s", shardUid, expectedSha256, GearsConfig_GetDependenciesUrl());
 
         char* sha256Command;
-        rg_asprintf(&sha256Command, "sha256sum "DEPS_FILE_PATH, shardUid, expectedSha256);
+        rg_asprintf(&sha256Command, "sha256sum "TMP_DEPS_FILE_PATH_FMT, shardUid, expectedSha256);
         FILE* f = popen(sha256Command, "r");
         RG_FREE(sha256Command);
         char sha256[SHA_256_SIZE];
         if(fscanf(f, "%64s", sha256) != 1){
-            RedisModule_Log(ctx, "warning", "Failed to calculate sha25 on file "DEPS_FILE_PATH, shardUid, expectedSha256);
+            RedisModule_Log(ctx, "warning", "Failed to calculate sha25 on file "TMP_DEPS_FILE_PATH_FMT, shardUid, expectedSha256);
             pclose(f);
             return REDISMODULE_ERR;
         }
@@ -3113,37 +3359,35 @@ static int RedisGears_InstallDeps(RedisModuleCtx *ctx) {
             return REDISMODULE_ERR;
         }
 
-        ExecCommand(ctx, "rm -rf "DEPS_FILE_DIR, shardUid, expectedSha256);
-        ExecCommand(ctx, "mkdir -p "DEPS_FILE_DIR, shardUid, expectedSha256);
+        ExecCommand(ctx, "rm -rf "TMP_DEPS_FILE_DIR_FMT, shardUid, expectedSha256);
+        ExecCommand(ctx, "mkdir -p "TMP_DEPS_FILE_DIR_FMT, shardUid, expectedSha256);
 
-        ExecCommand(ctx, "tar -xvf "DEPS_FILE_PATH" -C "DEPS_FILE_DIR, shardUid, expectedSha256, shardUid, expectedSha256);
+        ExecCommand(ctx, "tar -xvzf "TMP_DEPS_FILE_PATH_FMT" -C "TMP_DEPS_FILE_DIR_FMT, shardUid, expectedSha256, shardUid, expectedSha256);
 
-        ExecCommand(ctx, "mkdir -p "PYENV_INSTALL_DIR);
-        ExecCommand(ctx, "mv "DEPS_FILE_DIR"/var/opt/redislabs/lib/modules/python3/ "PYENV_INSTALL_DIR, shardUid, expectedSha256);
+        ExecCommand(ctx, "mkdir -p %s", PYINSTALL_DIR);
+        ExecCommand(ctx, "mv "TMP_DEPS_FILE_DIR_FMT"/python3_%s/ %s", shardUid, expectedSha256, REDISGEARS_VERSION_STR, PYINSTALL_DIR);
     }else{
-        RedisModule_Log(ctx, "notice", "Found python installation under: "PYENV_DIR);
+        RedisModule_Log(ctx, "notice", "Found python installation under: %s", PYENV_DIR);
     }
-    if(!skip_deps_install && GearsConfig_CreateVenv()){
-        rg_asprintf(&venvDir, "%s/.venv-%s", GearsConfig_GetVenvWorkingPath(), shardUid);
-    }else{
-        venvDir = PYENV_HOME_DIR;
-    }
-    DIR* dir = opendir(venvDir);
-    if(!dir){
-        if (skip_deps_install) {
-            RedisModule_Log(ctx, "warning", "No Python venv found and GEARS_NO_DEPS=1: aborting");
-            return REDISMODULE_ERR;
-        }
-        ExecCommand(ctx, "mkdir -p %s", venvDir);
-        int rc = ExecCommand(ctx, "/bin/bash -c \"source " PYENV_ACTIVATE_SCRIPT "; python -m virtualenv %s\"", venvDir);
-        if (rc) {
-            RedisModule_Log(ctx, "warning", "Failed to construct virtualenv");
-            ExecCommand(ctx, "rm -rf %s", venvDir);
-            return REDISMODULE_ERR;
+    if(GearsConfig_CreateVenv()){
+        rg_asprintf(&venvDir, "%s/.venv-%s", GearsConfig_GetPythonInstallationDir(), shardUid);
+        DIR* dir = opendir(venvDir);
+        if(!dir){
+            ExecCommand(ctx, "mkdir -p %s", venvDir);
+            setenv("VIRTUALENV_OVERRIDE_APP_DATA", venvDir, 1);
+            int rc = ExecCommand(ctx, "/bin/bash -c \"%s/bin/python3 -m virtualenv %s\"", PYENV_DIR, venvDir);
+            if (rc) {
+                RedisModule_Log(ctx, "warning", "Failed to construct virtualenv");
+                ExecCommand(ctx, "rm -rf %s", venvDir);
+                return REDISMODULE_ERR;
+            }
+        }else{
+            RedisModule_Log(ctx, "notice", "Found venv installation under: %s", venvDir);
+            closedir(dir);
         }
     }else{
-        RedisModule_Log(ctx, "notice", "Found venv installation under: %s", venvDir);
-        closedir(dir);
+        // we are not operating inside virtual env
+        venvDir = RG_STRDUP(PYENV_DIR);
     }
     return REDISMODULE_OK;
 }
@@ -3201,7 +3445,65 @@ void RedisGearsPy_ForceStop(unsigned long threadID){
     RedisGearsPy_Unlock(old);
 }
 
+static int PythonRecord_SendReply(Record* r, RedisModuleCtx* rctx){
+    PyObject* obj = PyObjRecordGet(r);
+    if(PyList_Check(obj)){
+        size_t listLen = PyList_Size(obj);
+        Record* rgl = RedisGears_ListRecordCreate(listLen);
+        for(int i = 0 ; i < listLen ; ++i){
+            Record* temp = PyObjRecordCreate();
+            PyObject* pItem = PyList_GetItem(obj, i);
+            PyObjRecordSet(temp, pItem);
+            Py_INCREF(pItem);
+            RedisGears_ListRecordAdd(rgl, temp);
+        }
+        RG_RecordSendReply(rgl, rctx);
+        RedisGears_FreeRecord(rgl);
+    }else if(PyLong_Check(obj)) {
+        RedisModule_ReplyWithLongLong(rctx, PyLong_AsLongLong(obj));
+    }else if(PyFloat_Check(obj)){
+        double d = PyFloat_AsDouble(obj);
+        RedisModuleString* str = RedisModule_CreateStringPrintf(NULL, "%lf", d);
+        RedisModule_ReplyWithString(rctx, str);
+        RedisModule_FreeString(NULL, str);
+    }else if(PyUnicode_Check(obj)) {
+        size_t len;
+        char* str = (char*)PyUnicode_AsUTF8AndSize(obj, &len);
+        RedisModule_ReplyWithStringBuffer(rctx, (char*)str, len);
+    }else{
+        RedisModule_ReplyWithStringBuffer(rctx, "PY RECORD", strlen("PY RECORD"));
+    }
+    return REDISMODULE_OK;
+}
+
+static int PythonRecord_Serialize(Gears_BufferWriter* bw, Record* base, char** err){
+    PythonRecord* r = (PythonRecord*)base;
+    if(RedisGearsPy_PyObjectSerialize(r->obj, bw, err) != REDISMODULE_OK){
+        return REDISMODULE_ERR;
+    }
+    return REDISMODULE_OK;
+}
+
+static void PythonRecord_Free(Record* base){
+    PythonRecord* record = (PythonRecord*)base;
+    if(record->obj && record->obj != Py_None){
+        void* old = RedisGearsPy_Lock(NULL);
+        Py_DECREF(record->obj);
+        RedisGearsPy_Unlock(old);
+    }
+}
+
+static Record* PythonRecord_Deserialize(Gears_BufferReader* br){
+    Record* r = PyObjRecordCreate();
+    PyObject* obj = RedisGearsPy_PyObjectDeserialize(br);
+    PyObjRecordSet(r, obj);
+    return r;
+}
+
 int RedisGearsPy_Init(RedisModuleCtx *ctx){
+    installDepsPool = Gears_thpool_init(1);
+    InitializeGlobalPaths();
+    PrintGlobalPaths(ctx);
     if(RedisGears_InstallDeps(ctx) != REDISMODULE_OK){
         RedisModule_Log(ctx, "warning", "Failed installing python dependencies");
         return REDISMODULE_ERR;
@@ -3218,10 +3520,11 @@ int RedisGearsPy_Init(RedisModuleCtx *ctx){
     PyMem_SetAllocator(PYMEM_DOMAIN_RAW, &allocator);
     PyMem_SetAllocator(PYMEM_DOMAIN_MEM, &allocator);
     PyMem_SetAllocator(PYMEM_DOMAIN_OBJ, &allocator);
-	char* arg = "Embeded";
-	size_t len = strlen(arg);
-    char* progName = PYENV_DIR;
-    Py_SetProgramName((wchar_t *)progName);
+    char* arg = "Embeded";
+    size_t len = strlen(arg);
+    wchar_t *pyHome = Py_DecodeLocale(PYENV_DIR, NULL);
+    Py_SetPythonHome(pyHome);
+    PyMem_RawFree(pyHome);
 
     EmbRedisGears.m_methods = EmbRedisGearsMethods;
     EmbRedisGears.m_size = sizeof(EmbRedisGearsMethods) / sizeof(*EmbRedisGearsMethods);
@@ -3232,7 +3535,10 @@ int RedisGearsPy_Init(RedisModuleCtx *ctx){
     PyImport_AppendInittab("redisAI", &PyInit_RedisAI);
 
     Py_Initialize();
-    RedisGears_SetupPyEnv(ctx);
+    if(GearsConfig_CreateVenv()){
+        // lets activate the virtual env we are operate in
+        RedisGears_SetupPyEnv(ctx);
+    }
     PyEval_InitThreads();
     wchar_t* arg2 = Py_DecodeLocale(arg, &len);
     PySys_SetArgv(1, &arg2);
@@ -3329,6 +3635,12 @@ int RedisGearsPy_Init(RedisModuleCtx *ctx){
         RG_FREE(error);
         return REDISMODULE_ERR;
     }
+
+    pythonRecordType = RedisGears_RecordTypeCreate("PythonRecord", sizeof(PythonRecord),
+                                                   PythonRecord_SendReply,
+                                                   PythonRecord_Serialize,
+                                                   PythonRecord_Deserialize,
+                                                   PythonRecord_Free);
 
     ArgType* pyCallbackType = RedisGears_CreateType("PyObjectType",
                                                     RedisGearsPy_PyObjectFree,

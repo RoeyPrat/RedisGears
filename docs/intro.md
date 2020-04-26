@@ -214,7 +214,7 @@ To see how this works in practice, we'll refactor our function to use a [**`filt
 !!! example "Example: `filter()` operation"
     ```
     127.0.0.1:6379> RG.PYEXECUTE "GB().filter(lambda x: x['key'].startswith('person:')).run()"
-    1) 1) "{'key': 'person:1', 'value': {'age': '60', 'name': 'Rick Sanchez'}}"
+    1) 1) "{'key': 'person:1', 'value': {'age': '70', 'name': 'Rick Sanchez'}}"
        2) "{'key': 'person:2', 'value': {'age': '14', 'name': 'Morty Smith'}}"
     2) (empty list or set)
     ```
@@ -243,7 +243,7 @@ The next change to the flow is much more significant. It adds a new operation be
 
 The `filter()` operation invokes the filtering function once for every input record it gets. The input record denoted as `x` in the examples, is a dictionary in our case and the function checks whether the value of its `key` key conforms to the requested pattern.
 
-The main difference between the function that uses the reader's key pattern and the one using the step is in time when the filtering act happens. In the key pattern's case, filtering is done by the reader itself - after it obtains the keys' names but before reading their values. Conversely, with the `filter()` operation in the flow, the reader reads all keys (and their values), that are only then are turned to records and filtered by the step.
+The main difference between the function that uses the reader's key pattern and the one using the step is in time when the filtering act happens. In the key pattern's case, filtering is done by the reader itself - after it obtains the keys' names but before reading their values. Conversely, with the `filter()` operation in the flow, the reader reads all keys (and their values), that are only then turned to records and filtered by the step.
 
 Functions can be as complex as needed and can consist of any number of steps that are executed sequentially. Furthermore, RedisGears Python API allows the use of all of the language's features to be used, including importing and using external packages.
 
@@ -319,7 +319,7 @@ The accumulator is initialized by RedisGears to a Pythonic `None`, so the functi
 We've seen how accumulating data allows a RedisGears function to calculate simple aggregates such as maximum and count. That pattern is also used for computing more complex ones, such as the average person age for example.
 
 ??? tip "The `avg()` operation"
-    The RedisGears Python API includes the [**`avg()`**](operations.md#avg) operation that you can always use instead of the coding your own.
+    The RedisGears Python API includes the [**`avg()`**](operations.md#avg) operation that you can always use instead of coding your own.
 
 To compute the average age from the data in our database, we'll need two accumulators: one for summing the records' values, and another one for counting them. After we've iterated all records to obtain these accumulated values, we want to output the quotient that results from their division.
 

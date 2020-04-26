@@ -40,6 +40,7 @@ def standalone(image):
 @pytest.mark.parametrize(
     'snippet,expected',
     [
+        ('docs/snippets/examples/automatic-expire.py', b'OK'),
         ('docs/snippets/examples/del-by-prefix.py', [[], []]),
         ('docs/snippets/examples/monte-carlo-pi.py', [[b'foo'], []]),
         ('docs/snippets/examples/stream-logger.py', b'OK'),
@@ -84,12 +85,15 @@ def standalone(image):
         ('docs/snippets/operations/sort.py', [[], []]),
         ('docs/snippets/readers/keysreader-register.py', b'OK'),
         ('docs/snippets/readers/keysreader-run.py', [[], []]),
-        ('docs/snippets/readers/pythonreader-run.py', [range(6379), []]),
+        ('docs/snippets/readers/pythonreader-run-001.py', [range(6379), []]),
+        ('docs/snippets/readers/pythonreader-run-002.py', [range(42), []]),
         ('docs/snippets/readers/shardidreader-run.py', [[1], []]),
         ('docs/snippets/readers/streamreader-register.py', b'OK'),
         ('docs/snippets/readers/streamreader-run.py', [[], []]),
+        ('docs/snippets/readers/commandreader-register.py', b'OK'),
         ('docs/snippets/runtime/configget.py', b'OK'),
         ('docs/snippets/runtime/execute.py', b'OK'),
+        ('docs/snippets/runtime/atomic.py', [[1], []]),
         ('docs/snippets/runtime/gearsconfigget.py', b'OK'),
         ('docs/snippets/runtime/hashtag.py', b'OK'),
         ('docs/snippets/runtime/log.py', [[], []]),
@@ -99,6 +103,7 @@ def standalone(image):
 def test_snippet(standalone, snippet, expected):
     with open(snippet, 'rb') as f:
         src = f.read()
+    standalone.flushall()
     r = standalone.execute_command('RG.PYEXECUTE', src)
     if type(expected) is list:
         assert len(expected[0]) == len(r[0])

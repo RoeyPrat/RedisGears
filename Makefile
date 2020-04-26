@@ -34,8 +34,8 @@ make clean      # remove binary files
 
 make deps       # build dependant modules
 make libevent   # build libevent
+make hiredis    # build hiredis
 make cpython    # build cpython
-make pyenv      # install cpython and virtual environment
 make all        # build all libraries and packages
 
 make test          # run tests
@@ -55,7 +55,7 @@ make verify-packs  # verify signatures of packages vs module so
 make show-version  # show module version
 endef
 
-MK_ALL_TARGETS=bindirs deps pyenv build ramp_pack verify-packs
+MK_ALL_TARGETS=bindirs deps build ramp_pack verify-packs
 
 include $(MK)/defs
 
@@ -63,9 +63,9 @@ GEARS_VERSION:=$(shell $(ROOT)/getver)
 
 #----------------------------------------------------------------------------------------------
 
-DEPENDENCIES=cpython libevent
+DEPENDENCIES=cpython libevent hiredis
 
-ifneq ($(filter all deps $(DEPENDENCIES) pyenv pack ramp_pack,$(MAKECMDGOALS)),)
+ifneq ($(filter all deps $(DEPENDENCIES) pack ramp_pack,$(MAKECMDGOALS)),)
 DEPS=1
 endif
 
@@ -78,6 +78,7 @@ ifeq ($(WITHPYTHON),1)
 export PYTHON_ENCODING ?= ucs4
 
 CPYTHON_BINDIR=bin/$(FULL_VARIANT.release)/cpython
+CPYTHON_BINROOT=bin/$(FULL_VARIANT.release)
 
 include build/cpython/Makefile.defs
 
@@ -91,6 +92,12 @@ include build/libevent/Makefile.defs
 
 #----------------------------------------------------------------------------------------------
 
+HIREDIS_BINDIR=bin/$(FULL_VARIANT.release)/hiredis
+
+include build/hiredis/Makefile.defs
+
+#----------------------------------------------------------------------------------------------
+
 CC=gcc
 SRCDIR=src
 
@@ -98,7 +105,7 @@ _SOURCES=utils/adlist.c utils/buffer.c utils/dict.c module.c execution_plan.c \
 	mgmt.c readers/keys_reader.c example.c filters.c mappers.c utils/thpool.c \
 	extractors.c reducers.c record.c cluster.c commands.c readers/streams_reader.c \
 	globals.c config.c lock_handler.c module_init.c slots_table.c common.c readers/command_reader.c \
-	readers/shardid_reader.c
+	readers/shardid_reader.c crc16.c
 ifeq ($(WITHPYTHON),1)
 _SOURCES += redisgears_python.c
 endif
@@ -115,12 +122,20 @@ CC_FLAGS += \
 	-fPIC -std=gnu99 \
 	-MMD -MF $(@:.o=.d) \
 	-include $(SRCDIR)/common.h \
-	-I$(SRCDIR) -Iinclude -I$(BINDIR) -Ideps -I. \
+	-I$(SRCDIR) \
+	-I$(BINDIR) \
+	-Ideps \
+	-I. \
+	-I deps/libevent/include \
+	-Ibin/$(FULL_VARIANT.release)/libevent/include \
+	-Ideps/hiredis \
+	-Ideps/hiredis/adapters \
 	-DREDISGEARS_GIT_SHA=\"$(GIT_SHA)\" \
 	-DREDISMODULE_EXPERIMENTAL_API \
 	$(CC_FLAGS.coverage)
 
 TARGET=$(BINROOT)/redisgears.so
+TARGET.snapshot=$(BINROOT)/snapshot/redisgears.so
 
 ifeq ($(DEBUG),1)
 CC_FLAGS += -g -O0 -DVALGRIND
@@ -143,7 +158,7 @@ CPYTHON_DIR=deps/cpython
 
 CC_FLAGS += \
 	-DWITHPYTHON \
-	-DCPYTHON_PATH=\"$(CPYTHON_PREFIX)/\" \
+	-DCPYTHON_PATH=\"$(abspath $(CPYTHON_BINROOT))/\" \
 	-I$(CPYTHON_DIR)/Include \
 	-I$(CPYTHON_DIR) \
 	-I$(BINROOT)/cpython \
@@ -163,10 +178,12 @@ endif
 
 endif # WITHPYTHON
 
-EMBEDDED_LIBS += $(LIBEVENT)
-
 ifeq ($(wildcard $(LIBEVENT)),)
 MISSING_DEPS += $(LIBEVENT)
+endif
+
+ifeq ($(wildcard $(HIREDIS)),)
+MISSING_DEPS += $(HIREDIS)
 endif
 
 #----------------------------------------------------------------------------------------------
@@ -181,7 +198,7 @@ endif
 
 MK_CUSTOM_CLEAN=1
 
-.PHONY: deps $(DEPENDENCIES) pyenv static pack ramp_pack test setup fetch
+.PHONY: deps $(DEPENDENCIES) static pack ramp_pack test setup fetch
 
 # build: bindirs $(TARGET)
 
@@ -205,8 +222,10 @@ $(BINDIR)/cloudpickle.auto.h: $(SRCDIR)/cloudpickle.py
 
 #----------------------------------------------------------------------------------------------
 
-RAMP.release:=$(shell JUST_PRINT=1 RAMP=1 DEPS=0 RELEASE=1 SNAPSHOT=0 ./pack.sh)
-RAMP.snapshot:=$(shell JUST_PRINT=1 RAMP=1 DEPS=0 RELEASE=0 SNAPSHOT=1 ./pack.sh)
+RAMP_VARIANT=$(subst release,,$(FLAVOR))$(_VARIANT.string)
+
+RAMP.release:=$(shell JUST_PRINT=1 RAMP=1 DEPS=0 RELEASE=1 SNAPSHOT=0 VARIANT=$(RAMP_VARIANT) ./pack.sh)
+RAMP.snapshot:=$(shell JUST_PRINT=1 RAMP=1 DEPS=0 RELEASE=0 SNAPSHOT=1 VARIANT=$(RAMP_VARIANT) ./pack.sh)
 DEPS_TAR.release:=$(shell JUST_PRINT=1 RAMP=0 DEPS=1 RELEASE=1 SNAPSHOT=0 ./pack.sh)
 DEPS_TAR.snapshot:=$(shell JUST_PRINT=1 RAMP=0 DEPS=1 RELEASE=0 SNAPSHOT=1 ./pack.sh)
 
@@ -231,7 +250,7 @@ $(eval $(call build_deps_args,snapshot))
 ifeq ($(OS),macosx)
 EMBEDDED_LIBS_FLAGS=$(foreach L,$(EMBEDDED_LIBS),-Wl,-force_load,$(L))
 else
-EMBEDDED_LIBS_FLAGS=-Wl,--whole-archive $(EMBEDDED_LIBS) -Wl,--no-whole-archive
+EMBEDDED_LIBS_FLAGS=-Wl,-Bstatic $(HIREDIS) $(LIBEVENT) -Wl,-Bdynamic -Wl,--whole-archive $(EMBEDDED_LIBS) -Wl,--no-whole-archive
 endif
 
 STRIP:=strip --strip-debug --strip-unneeded
@@ -251,9 +270,9 @@ endif
 
 static: $(TARGET:.so=.a)
 
-$(TARGET:.so=.a): $(OBJECTS) $(LIBEVENT) $(LIBPYTHON)
+$(TARGET:.so=.a): $(OBJECTS) $(LIBEVENT) $(LIBPYTHON) $(HIREDIS)
 	@echo Creating $@...
-	$(SHOW)$(AR) rcs $@ $(filter-out module_init,$(OBJECTS)) $(LIBEVENT)
+	$(SHOW)$(AR) rcs $@ $(filter-out module_init,$(OBJECTS)) $(LIBEVENT) $(HIREDIS)
 
 #----------------------------------------------------------------------------------------------
 
@@ -274,17 +293,13 @@ ifeq ($(DEPS),1)
 
 #----------------------------------------------------------------------------------------------
 
-deps: $(LIBPYTHON) $(LIBEVENT)
+deps: $(LIBPYTHON) $(LIBEVENT) $(HIREDIS)
 
 cpython: $(LIBPYTHON)
 
 $(LIBPYTHON):
 	@echo Building cpython...
 	$(SHOW)$(MAKE) --no-print-directory -C build/cpython DEBUG=
-
-pyenv:
-	@echo Building pyenv...
-	$(SHOW)$(MAKE) --no-print-directory -C build/cpython DEBUG= pyenv
 
 #----------------------------------------------------------------------------------------------
 
@@ -293,6 +308,14 @@ libevent: $(LIBEVENT)
 $(LIBEVENT):
 	@echo Building libevent...
 	$(SHOW)$(MAKE) --no-print-directory -C build/libevent DEBUG=
+
+#----------------------------------------------------------------------------------------------
+
+hiredis: $(HIREDIS)
+
+$(HIREDIS):
+	@echo Building hiredis...
+	$(SHOW)$(MAKE) --no-print-directory -C build/hiredis DEBUG=
 
 #----------------------------------------------------------------------------------------------
 
@@ -308,15 +331,16 @@ ifeq ($(DIAG),1)
 $(info *** MK_CLEAN_DIR=$(MK_CLEAN_DIR))
 $(info *** LIBPYTHON=$(LIBPYTHON))
 $(info *** LIBEVENT=$(LIBEVENT))
+$(info *** HIREDIS=$(HIREDIS))
 $(info *** MISSING_DEPS=$(MISSING_DEPS))
 endif
 
 clean:
 ifeq ($(ALL),1)
-	$(SHOW)rm -rf $(BINDIR) $(TARGET) $(notdir $(TARGET)) $(BINROOT)/redislabs
+	$(SHOW)rm -rf $(BINDIR) $(TARGET) $(TARGET.snapshot) $(notdir $(TARGET)) $(BINROOT)/redislabs
 else
 	-$(SHOW)find $(BINDIR) -name '*.[oadh]' -type f -delete
-	$(SHOW)rm -f $(TARGET) $(TARGET:.so=.a) $(notdir $(TARGET)) \
+	$(SHOW)rm -f $(TARGET) $(TARGET.snapshot) $(TARGET:.so=.a) $(notdir $(TARGET)) \
 		artifacts/release/$(DEPS_TAR.release)* artifacts/snapshot/$(DEPS_TAR.snapshot)*
 endif
 ifeq ($(DEPS),1)
@@ -327,11 +351,11 @@ endif
 
 artifacts/release/$(RAMP.release) artifacts/snapshot/$(RAMP.snapshot): $(TARGET) ramp.yml
 	@echo Packing module...
-	$(SHOW)RAMP=1 DEPS=0 ./pack.sh $(TARGET)
+	$(SHOW)RAMP=1 DEPS=0 VARIANT=$(RAMP_VARIANT) ./pack.sh $(TARGET)
 
 artifacts/release/$(DEPS_TAR.release) artifacts/snapshot/$(DEPS_TAR.snapshot): $(CPYTHON_PREFIX)
 	@echo Packing dependencies...
-	$(SHOW)RAMP=0 DEPS=1 ./pack.sh $(TARGET)
+	$(SHOW)RAMP=0 DEPS=1 CPYTHON_PREFIX=$(CPYTHON_PREFIX) ./pack.sh $(TARGET)
 
 ramp_pack: artifacts/release/$(RAMP.release) artifacts/snapshot/$(RAMP.snapshot)
 
