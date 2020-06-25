@@ -523,6 +523,7 @@ static char* FlatExecutionPlan_DeserializeID(Gears_BufferReader *br) {
     size_t len;
     char* idBuff = RedisGears_BRReadBuffer(br, &len);
     RedisModule_Assert(len == ID_LEN);
+    return idBuff;
 }
 
 static int FlatExecutionPlan_DeserializeInternal(FlatExecutionPlan* ret, const char* data, size_t dataLen, char** err, int encver){
@@ -2368,7 +2369,7 @@ int FlatExecutionPlan_Register(FlatExecutionPlan* fep, ExecutionMode mode, void*
     RedisModule_Replicate(ctx, RG_INNER_REGISTER_COMMAND, "b", buff->buff, buff->size);
     RedisModule_FreeThreadSafeContext(ctx);
     Gears_BufferFree(buff);
-    fep->registered = true;
+    FlatExecutionPlan_SetRegistered(fep);
     return 1;
 }
 
