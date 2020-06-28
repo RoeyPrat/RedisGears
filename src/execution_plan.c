@@ -1585,6 +1585,13 @@ static void ExecutionPlan_RegisterForRun(ExecutionPlan* ep){
 
 void FlatExecutionPlan_AddToRegisterDict(FlatExecutionPlan* fep){
     Gears_dictAdd(epData.registeredFepDict, fep->id, fep);
+
+    // fire OnRegister callback
+    if(fep->onRegisteredStep.stepName){
+        RedisGears_FlatExecutionOnRegisteredCallback onRegistered = FlatExecutionOnRegisteredsMgmt_Get(fep->onRegisteredStep.stepName);
+        RedisModule_Assert(onRegistered);
+        onRegistered(fep, fep->onRegisteredStep.arg.stepArg);
+    }
 }
 
 void FlatExecutionPlan_RemoveFromRegisterDict(FlatExecutionPlan* fep){
@@ -1601,13 +1608,6 @@ static int FlatExecutionPlan_RegisterInternal(FlatExecutionPlan* fep, RedisGears
     // the registeredFepDict holds a weak pointer to the fep struct. It does not increase
     // the refcount and will be remove when the fep will be unregistered
     FlatExecutionPlan_AddToRegisterDict(fep);
-
-    // call the on registered callback if set
-    if(fep->onRegisteredStep.stepName){
-        RedisGears_FlatExecutionOnRegisteredCallback onRegistered = FlatExecutionOnRegisteredsMgmt_Get(fep->onRegisteredStep.stepName);
-        RedisModule_Assert(onRegistered);
-        onRegistered(fep, fep->onRegisteredStep.arg.stepArg);
-    }
     return REDISMODULE_OK;
 }
 
